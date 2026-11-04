@@ -7,7 +7,7 @@ for the architecture, data flow and full setup guide.
 |---|---|---|
 | `sync/` | Sync job: ingest, normalize, enrich, enqueue, publish; API clients; HubSpot schema provisioning; structured logging | `python -m sync.main [--once]` |
 | `db/` | PostgreSQL connection, idempotent `sql/schema.sql`, repositories, advisory locks | used by `sync/` |
-| `oauth/` | FastAPI OAuth callback service (`/oauth/callback`, `/healthz`) | `uvicorn main:app` (from `oauth/`) |
+| `oauth/` | FastAPI OAuth service (`/oauth/install`, `/oauth/callback`, `/healthz`) | `uvicorn main:app` (from `oauth/`) |
 | `shared/` | Legacy helpers that nothing imports any more (scheduled for removal) | — |
 
 ## Quick start

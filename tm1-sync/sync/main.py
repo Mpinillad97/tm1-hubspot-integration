@@ -3,7 +3,7 @@ import time
 
 from dotenv import load_dotenv
 
-from db.locks import release_lock, try_acquire_lock
+from db.locks import AdvisoryLock
 from db.migrate import migrate
 from db.events_repo import backfill_order_events_from_outbox
 from db.repo import count_outbox_by_status, reclaim_stale_processing_rows
@@ -30,7 +30,9 @@ def run_once() -> None:
         return
 
     lock_name = f"tm1_sync:{cfg.client_id}"
-    if not try_acquire_lock(lock_name):
+    # Held on a dedicated connection until the finally block below, for the whole run.
+    lock = AdvisoryLock(lock_name)
+    if not lock.acquire():
         log("run.skipped_lock_not_acquired", level="WARN", lock_name=lock_name)
         return
 
@@ -152,7 +154,9 @@ def run_once() -> None:
         log("run.error", level="ERROR", err=type(e).__name__)
         raise
     finally:
-        release_lock(lock_name)
+        if not lock.release():
+            # The lock connection is closed regardless, which releases the session lock.
+            log("run.lock.release_failed", level="WARN", lock_name=lock_name)
 
 
 def main():

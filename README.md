@@ -77,6 +77,7 @@ flowchart LR
 ### Reliable delivery
 - **Outbox queue** with nine message types (objects and associations). Dedupe keys are enforced by a partial unique index while messages are in flight.
 - **Concurrency-safe batch claiming** with `SELECT … FOR UPDATE SKIP LOCKED`.
+- **One run per tenant at a time.** A PostgreSQL session advisory lock is held on a dedicated connection for the entire run. Overlapping runs (a slow run and the next scheduled tick) exit immediately with `run.skipped_lock_not_acquired`.
 - **Retry classification.** 429, 5xx and network errors are retryable; other 4xx responses are terminal. Retries use exponential backoff with jitter (10 s → 30 min) and honor `Retry-After`.
 - **Stale-lease recovery.** Messages stuck in `processing` are automatically returned to the queue.
 - **Idempotent upserts** keyed on external IDs (`tm1_unique_id`, `tm_event_id`, `seat_unique_id`, email), so retries update existing records.
@@ -223,7 +224,25 @@ pip install -r sync/requirements.txt -r oauth/requirements.txt
    ```bash
    cd oauth && uvicorn main:app --port 8080
    ```
-4. Install the app in your HubSpot portal. The callback stores the tokens in `oauth_tokens`.
+4. Open `https://<your-oauth-service-host>/oauth/install` in a browser and approve the app in
+   your HubSpot portal. The service issues a signed, single-use `state` bound to your browser
+   by a short-lived cookie. The callback rejects any request whose `state` doesn't match,
+   then stores the tokens in `oauth_tokens`. Always start installs from `/oauth/install`:
+   installs started from a link without a valid `state` are rejected.
+
+   **OAuth deployment requirements**
+   - `HUBSPOT_REDIRECT_URI` must exactly match one of the `redirectUrls` in `app-hsmeta.json`.
+     The service sends this value in both the authorize request and the token exchange.
+   - Open `/oauth/install` on the **same scheme and host** as `HUBSPOT_REDIRECT_URI`. The state
+     cookie is host-only, so starting on another hostname (for example the hosting platform's
+     default domain when the redirect URI uses a custom domain) causes `invalid_state`.
+   - The callback must be reachable at the browser-visible path `/oauth/callback`. The cookie
+     is scoped to `/oauth`, so a reverse proxy that serves the app under a prefix such as
+     `/api/` is not supported.
+   - Use `https` in production; the cookie is then marked `Secure`. Plain `http` works only
+     for local development (`http://localhost:8080/oauth/callback`).
+   - Complete the HubSpot approval within 10 minutes of opening `/oauth/install`. An expired
+     `state` is rejected; just start again.
 
 ### 4. Run a sync
 ```bash
@@ -248,6 +267,12 @@ docker run --rm -p 8080:8080 --env-file .env tm1-oauth
 ```
 In production, the sync image is run on a schedule (for example every 15 minutes) by the hosting platform's job scheduler. The OAuth image runs as a small web service.
 
+**Database connection requirement.** The per-tenant job lock is a session-level advisory
+lock, so the sync job's `DATABASE_URL` must be a direct connection or a **session-mode**
+pool. Through a transaction-mode pooler (for example PgBouncer in `transaction` mode), the
+lock would not protect the run. Each run uses one extra, mostly idle, connection to hold
+the lock.
+
 ---
 
 ## API integrations
@@ -264,10 +289,20 @@ In production, the sync image is run on a schedule (for example every 15 minutes
 
 ## Testing
 
-There is no automated test suite yet. It is the next milestone on the roadmap. The core
-transformation logic was written as pure functions with test coverage in mind: seat and
-event extraction, HubSpot property mappers, retry classification, backoff and the rate
-limiter.
+A first set of tests covers log redaction, OAuth `state` validation and the job lock. They
+use only the standard library and need no network:
+
+```bash
+cd tm1-sync
+python -m unittest discover -s tests -v   # with the sync and oauth requirements installed
+
+# Optional: also run the lock tests against a disposable PostgreSQL
+TEST_DATABASE_URL=postgresql://postgres@localhost:5432/postgres python -m unittest discover -s tests -v
+```
+
+Broader coverage is on the roadmap. The core transformation logic was written as pure
+functions with testing in mind: seat and event extraction, HubSpot property mappers, retry
+classification, backoff and the rate limiter.
 
 ---
 
@@ -275,8 +310,8 @@ limiter.
 
 - No credentials in source control. All secrets come from environment variables, and only placeholder `.env.example` templates are tracked.
 - `.gitignore` and `.dockerignore` exclude secrets, local state and data exports from commits and container images.
-- OAuth tokens are stored server-side and refreshed automatically.
-- Customers flagged `piiCleared` by TM1 are never synced. Item-level logs hash email addresses, and HTTP error bodies are truncated.
+- OAuth tokens are stored server-side and refreshed automatically. The install flow is protected against CSRF by a signed, expiring, browser-bound `state` parameter.
+- Customers flagged `piiCleared` by TM1 are never synced. The logger replaces email addresses in every field with a short hash, and HTTP error bodies are truncated.
 - The export tool produces personal data. Write its output outside the repository and handle it under your data-protection obligations.
 
 ---
@@ -285,12 +320,10 @@ limiter.
 
 The following hardening work is **planned and not yet implemented**:
 
-- [ ] Hold the per-tenant advisory lock for the full run, so overlapping runs are rejected
 - [ ] Transactional outbox: write normalized state and outbox messages in a single transaction
 - [ ] Maximum delivery attempts with a dead-letter state and alerting
 - [ ] Persist the discovered HubSpot metadata cache across runs
-- [ ] Remove the remaining raw identifiers from logs; validate OAuth `state`
-- [ ] Unit and integration test suite (pytest, PostgreSQL service container)
+- [ ] Broader unit and integration test suite (pytest, PostgreSQL service container)
 - [ ] CI: lint (Ruff), tests, image builds, secret scanning, dependency audit
 - [ ] `docker-compose` development environment with mocked external APIs
 - [ ] HubSpot batch upsert endpoints; connection pooling; versioned migrations

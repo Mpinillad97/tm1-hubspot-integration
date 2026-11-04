@@ -1,7 +1,12 @@
 import os
 import json
+import hashlib
+import hmac
+import secrets
+import time
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
+from urllib.parse import quote, urlencode
 
 import requests
 from fastapi import FastAPI, Request
@@ -12,7 +17,98 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI()
-TOKENS_FILE = "tokens.json" 
+TOKENS_FILE = "tokens.json"
+
+# -------------------------
+# OAuth `state` (CSRF protection)
+# -------------------------
+HUBSPOT_AUTHORIZE_URL = "https://app.hubspot.com/oauth/authorize"
+
+# Must match `requiredScopes` in TM1_Hubspot_data_sync/src/app/app-hsmeta.json
+# (enforced by tests/test_oauth_state.py).
+HUBSPOT_SCOPES = (
+    "oauth",
+    "crm.objects.contacts.read",
+    "crm.objects.contacts.write",
+    "crm.schemas.orders.read",
+    "crm.objects.orders.read",
+    "crm.objects.orders.write",
+    "crm.pipelines.orders.read",
+    "crm.schemas.custom.read",
+    "crm.schemas.custom.write",
+    "crm.objects.custom.read",
+    "crm.objects.custom.write",
+)
+
+STATE_COOKIE = "hs_oauth_state"
+STATE_COOKIE_PATH = "/oauth"
+STATE_TTL_SECONDS = 600
+
+
+def _state_key(client_secret: str) -> bytes:
+    # Derived sub-key: the client secret itself is never used directly as the HMAC key.
+    return hmac.new(client_secret.encode("utf-8"), b"tm1-sync/oauth-state/v1", hashlib.sha256).digest()
+
+
+def _state_signature(client_secret: str, nonce: str, issued_at: str) -> str:
+    msg = f"{nonce}.{issued_at}".encode("utf-8")
+    return hmac.new(_state_key(client_secret), msg, hashlib.sha256).hexdigest()
+
+
+def issue_state(client_secret: str, now: Optional[float] = None) -> Tuple[str, str]:
+    """
+    Returns (state, nonce). `state` is sent to HubSpot; `nonce` is stored in a cookie
+    so the callback can verify that it belongs to the browser that started the flow.
+    """
+    nonce = secrets.token_urlsafe(32)
+    issued_at = str(int(now if now is not None else time.time()))
+    return f"{nonce}.{issued_at}.{_state_signature(client_secret, nonce, issued_at)}", nonce
+
+
+def validate_state(
+    state: Optional[str],
+    cookie_nonce: Optional[str],
+    client_secret: str,
+    now: Optional[float] = None,
+) -> Optional[str]:
+    """Returns None when valid, otherwise a short reason code."""
+    if not state:
+        return "missing_state"
+    if not cookie_nonce:
+        return "missing_state_cookie"
+
+    parts = state.split(".")
+    if len(parts) != 3 or not all(parts):
+        return "malformed_state"
+    nonce, issued_at, signature = parts
+
+    expected = _state_signature(client_secret, nonce, issued_at)
+    if not hmac.compare_digest(signature, expected):
+        return "bad_signature"
+
+    try:
+        age = (now if now is not None else time.time()) - int(issued_at)
+    except ValueError:
+        return "malformed_state"
+    if age < 0 or age > STATE_TTL_SECONDS:
+        return "expired_state"
+
+    if not hmac.compare_digest(nonce, cookie_nonce):
+        return "state_mismatch"
+    return None
+
+
+def build_authorize_url(client_id: str, redirect_uri: str, state: str) -> str:
+    query = urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": " ".join(HUBSPOT_SCOPES),
+            "state": state,
+        },
+        quote_via=quote,
+    )
+    return f"{HUBSPOT_AUTHORIZE_URL}?{query}"
 
 def _db_url() -> Optional[str]:
     url = os.getenv("DATABASE_URL")
@@ -75,6 +171,30 @@ def save_tokens(portal_id: str, data: Dict[str, Any]) -> str:
 def health():
     return {"ok": True, "db": bool(_db_url())}
 
+@app.get("/oauth/install")
+def oauth_install():
+    """Starts the install flow: issues a `state`, binds it to this browser, redirects to HubSpot."""
+    client_id = os.getenv("HUBSPOT_CLIENT_ID")
+    client_secret = os.getenv("HUBSPOT_CLIENT_SECRET")
+    redirect_uri = os.getenv("HUBSPOT_REDIRECT_URI")
+
+    if not client_id or not client_secret or not redirect_uri:
+        return JSONResponse({"ok": False, "error": "missing_env"}, status_code=500)
+
+    state, nonce = issue_state(client_secret)
+    response = RedirectResponse(url=build_authorize_url(client_id, redirect_uri, state), status_code=302)
+    response.set_cookie(
+        STATE_COOKIE,
+        nonce,
+        max_age=STATE_TTL_SECONDS,
+        path=STATE_COOKIE_PATH,
+        httponly=True,
+        secure=redirect_uri.lower().startswith("https://"),
+        samesite="lax",  # sent on HubSpot's top-level redirect back to the callback
+    )
+    return response
+
+
 @app.get("/oauth/callback")
 async def oauth_callback(request: Request):
     code = request.query_params.get("code")
@@ -93,6 +213,18 @@ async def oauth_callback(request: Request):
 
     if not client_id or not client_secret or not redirect_uri:
         return JSONResponse({"ok": False, "error": "missing_env"}, status_code=500)
+
+    # CSRF protection: only complete flows started by /oauth/install in this browser.
+    # Validated before the authorization code is sent anywhere.
+    state_error = validate_state(
+        request.query_params.get("state"),
+        request.cookies.get(STATE_COOKIE),
+        client_secret,
+    )
+    if state_error:
+        response = JSONResponse({"ok": False, "error": "invalid_state"}, status_code=400)
+        response.delete_cookie(STATE_COOKIE, path=STATE_COOKIE_PATH)
+        return response
 
     r = requests.post(
         "https://api.hubapi.com/oauth/v3/token",
@@ -116,5 +248,7 @@ async def oauth_callback(request: Request):
     saved_to = save_tokens(portal_id, data)
 
     # Redirect to home portal after successful auth
-    hubspot_home = f"https://app.hubspot.com/home?portalId={portal_id}" 
-    return RedirectResponse(url=hubspot_home, status_code=302)
+    hubspot_home = f"https://app.hubspot.com/home?portalId={portal_id}"
+    response = RedirectResponse(url=hubspot_home, status_code=302)
+    response.delete_cookie(STATE_COOKIE, path=STATE_COOKIE_PATH)  # single use
+    return response
