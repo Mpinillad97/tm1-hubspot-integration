@@ -1,6 +1,8 @@
+import hashlib
 import json
 import os
 import random
+import re
 import sys
 import time
 import uuid
@@ -67,9 +69,39 @@ def get_client_id() -> str:
     return _client_id.get()
 
 
+# Matches email addresses anywhere in a string (field values, HTTP body snippets,
+# exception messages, dedupe keys such as "<order_id>-><email>").
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+
+
+def email_hash(value: str) -> str:
+    """
+    Short, non-reversible identifier for an email address. Same algorithm as
+    sync.hubspot_client.sha10, so redacted values match existing `email_hash` fields.
+    """
+    return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()[:10]
+
+
+def redact_pii(value: Any) -> Any:
+    """
+    Replace email addresses in strings (recursively through dicts, lists and tuples)
+    with `<email:hash>`. Non-string scalars are returned unchanged.
+    """
+    if isinstance(value, str):
+        if "@" not in value:
+            return value
+        return _EMAIL_RE.sub(lambda m: f"<email:{email_hash(m.group(0))}>", value)
+    if isinstance(value, dict):
+        return {k: redact_pii(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_pii(v) for v in value]
+    return value
+
+
 def log(event: str, level: str = "INFO", **fields: Any) -> None:
     """
     Structured JSON log. Always includes ts, event, run_id, client_id, component.
+    Email addresses in any field are redacted before the line is written.
     """
     current_level = _get_level()
     if _level_num(level) < _level_num(current_level):
@@ -84,9 +116,9 @@ def log(event: str, level: str = "INFO", **fields: Any) -> None:
         "component": _component,
     }
 
-    # Attach fields
+    # Attach fields (redacted: logs must never contain customer email addresses)
     for k, v in fields.items():
-        payload[k] = v
+        payload[k] = redact_pii(v)
 
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
