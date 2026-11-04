@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------
+# Secrets & credentials — never commit real values.
+# Only the *.env.example templates (placeholders) are tracked.
+# ---------------------------------------------------------------
+.env
+.env.*
+*.env
+!.env.example
+!**/.env.example
+tokens.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+id_rsa*
+.secrets/
+secrets/
+hubspot.config.yml
+hubspot.config.yaml
+
+# ---------------------------------------------------------------
+# Real data, exports and database dumps — keep outside the repo.
+# ---------------------------------------------------------------
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+*.dump
+*.pgdump
+*.sql.gz
+data/
+exports/
+state.json
+
+# Local databases and backups
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+
+# ---------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# ---------------------------------------------------------------
+# Node / HubSpot project tooling
+# ---------------------------------------------------------------
+node_modules/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------
+*.log
+logs/
+
+# ---------------------------------------------------------------
+# Local editor / assistant configuration
+# ---------------------------------------------------------------
+.claude/
+.cursor/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,37 @@
+# Build context for the sync job image:
+#   docker build -f sync/Dockerfile -t tm1-sync-job .   (run from tm1-sync/)
+# Docker only reads the .dockerignore at the root of the build context,
+# so this file (not one inside sync/) is the one that applies.
+
+# Secrets and local state — must never be baked into an image
+**/.env
+**/.env.*
+!**/.env.example
+**/*.env
+**/tokens.json
+**/state.json
+**/*.pem
+**/*.key
+
+# Local environments, caches and build artifacts
+**/.venv
+**/venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/*.log
+
+# Data exports
+**/*.csv
+**/*.xlsx
+
+# Not needed by the sync image (it only copies sync/ and db/)
+oauth/
+shared/
+README.md
+
+# VCS / editor
+.git
+**/.DS_Store
